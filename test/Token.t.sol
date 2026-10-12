@@ -18,7 +18,7 @@ contract TokenTest is Test {
     }
 
     function test_metadataAndPolicySupply() public view {
-        assertEq(token.name(), "Democratizing Collectable Acquisitions");
+        assertEq(token.name(), "Democratizing Collectable Acquisions");
         assertEq(token.symbol(), "DCA");
         assertEq(token.decimals(), 18);
         assertEq(token.totalSupply(), SUPPLY);

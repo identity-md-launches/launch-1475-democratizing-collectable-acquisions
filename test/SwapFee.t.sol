@@ -78,8 +78,17 @@ contract SwapFeeTest is HookFixture {
         beforeEth = CREATOR.balance;
         Outcome memory second = _trade(false, true, 100 ether);
         _assertAccounting(second, first.pending, beforeEth);
-        assertEq(second.pending, 0);
-        assertEq(second.spent, first.pending + second.fee);
+        // The backlog drains at most BACKLOG_MULTIPLE fees per swap, never all at once.
+        assertEq(second.spent, second.fee + second.fee * hook.BACKLOG_MULTIPLE());
+        assertEq(second.pending, first.pending - second.fee * hook.BACKLOG_MULTIPLE());
+        uint256 pending = second.pending;
+        for (uint256 i; i < 10 && pending != 0; ++i) {
+            Outcome memory next = _trade(i % 2 == 0, true, 100 ether);
+            assertLe(next.spent, next.fee * (hook.BACKLOG_MULTIPLE() + 1));
+            assertEq(next.pending + next.spent, pending + next.fee);
+            pending = next.pending;
+        }
+        assertEq(pending, 0, "backlog fully converted over later swaps");
     }
 
     function test_absoluteCeilingDefersFeeThenOwnerCanRestoreConversion() public {
@@ -178,15 +187,25 @@ contract SwapFeeTest is HookFixture {
         assertEq(manager.balanceOf(address(hook), 0), 0);
     }
 
-    function test_swapWithoutConfiguredMarketRevertsAtomically() public {
+    function test_swapsBeforeOwnerConfiguresMarketChargeFeeAsClaims() public {
         _deploy(true, false, true);
-        uint256 beforePair = pair.balanceOf(address(this));
-        vm.expectRevert();
-        router.swap(key, _params(true, true, 100 ether), 100 ether, 0);
-        assertEq(pair.balanceOf(address(this)), beforePair);
-        assertEq(manager.balanceOf(address(hook), uint160(FWA)), 0);
+        assertFalse(hook.conversionConfigured());
+        for (uint256 mode; mode < 4; ++mode) {
+            uint256 claimsBefore = manager.balanceOf(address(hook), uint160(FWA));
+            Outcome memory o = _trade(mode < 2, mode % 2 == 0, 100 ether);
+            _assertAccounting(o, claimsBefore, 0);
+            assertGt(o.fee, 0);
+            assertEq(o.spent, 0);
+            assertEq(o.ethOut, 0);
+            assertEq(manager.balanceOf(address(hook), uint160(FWA)), claimsBefore + o.fee);
+        }
+        assertEq(CREATOR.balance, 0);
+        uint256 backlog = manager.balanceOf(address(hook), uint160(FWA));
         _configure(1000, Q96 * 2);
-        _checkTrade(true, true, 100 ether);
+        Outcome memory next = _trade(true, true, 100 ether);
+        _assertAccounting(next, backlog, 0);
+        assertEq(next.spent, next.fee + next.fee * hook.BACKLOG_MULTIPLE());
+        assertGt(CREATOR.balance, 0);
     }
 
     function test_partialPairSpecifiedSwapsRevertWithoutFee() public {

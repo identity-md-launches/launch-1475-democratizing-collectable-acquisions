@@ -67,6 +67,10 @@ abstract contract HookFixture is Test {
         if (FWA.code.length == 0) vm.etch(FWA, address(new MockERC20("FWA", "FWA", 0)).code);
         pair = MockERC20(FWA);
         pair.mint(address(this), 1_000_000_000 ether);
+        // Model FWA's real guard: this test is FWA's exempt owner, the router is a distributor,
+        // the manager edge needs a transient allowance, and every other transfer (including any
+        // withdrawal to the hook) reverts.
+        pair.setPoolManager(address(manager));
         hook = DCAHook(
             HookDeployer.deploy(
                 abi.encodePacked(
@@ -75,6 +79,7 @@ abstract contract HookFixture is Test {
             )
         );
         router = new PoolTestRouter(manager);
+        pair.setDistributor(address(router), true);
         key = PoolKey({
             currency0: Currency.wrap(tokenBelowPair ? address(token) : FWA),
             currency1: Currency.wrap(tokenBelowPair ? FWA : address(token)),
@@ -90,8 +95,6 @@ abstract contract HookFixture is Test {
         router.modifyLiquidity(key, _liquidity(MAIN_LIQUIDITY), MAIN_LIQUIDITY, MAIN_LIQUIDITY);
         if (fundMarket) _fundMarket();
         if (configure) _configure(1000, Q96 * 2);
-        // Model FWA's restriction: any attempt to withdraw fee FWA to the hook fails.
-        pair.setBlockedRecipient(address(hook));
     }
 
     function _fundMarket() internal {
@@ -100,9 +103,11 @@ abstract contract HookFixture is Test {
         );
     }
 
+    /// @dev Configuring resets the price anchor; sales resume from the next block.
     function _configure(uint16 moveBps, uint160 ceiling) internal {
         vm.prank(CREATOR);
         hook.setConversionPool(market, moveBps, ceiling);
+        vm.roll(block.number + 1);
     }
 
     function _liquidity(uint256 amount) internal pure returns (ModifyLiquidityParams memory) {

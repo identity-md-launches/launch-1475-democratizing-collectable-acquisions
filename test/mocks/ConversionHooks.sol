@@ -40,6 +40,32 @@ contract ReentrantConversionHook {
     }
 }
 
+/// @dev A market whose hook refuses every swap: the launch hook must fall back to claims.
+contract RevertingConversionHook {
+    error MarketClosed();
+
+    function beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        revert MarketClosed();
+    }
+}
+
+/// @dev A market whose hook burns every unit of gas it is given.
+contract GasBurningConversionHook {
+    uint256 private sink;
+
+    function beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata)
+        external
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        while (true) sink += 1;
+        return (IHooks.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
+    }
+}
+
 contract NegativeOutputConversionHook {
     IPoolManager private immutable manager;
 

@@ -61,6 +61,7 @@ contract ConversionSecurityTest is HookFixture {
         );
         vm.prank(CREATOR);
         hook.setConversionPool(hooked, 1000, Q96 * 2);
+        vm.roll(block.number + 1);
     }
 
     function _atFlags(bytes memory runtime, uint160 flags) internal returns (address at) {

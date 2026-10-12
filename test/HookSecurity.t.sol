@@ -226,6 +226,7 @@ contract HookSecurityTest is HookFixture {
         );
         vm.prank(CREATOR);
         hook.setConversionPool(replacement, 1000, Q96 * 2);
+        vm.roll(block.number + 1);
         assertEq(manager.balanceOf(address(hook), uint160(FWA)), first.fee);
         Outcome memory next = _trade(false, true, 100 ether);
         assertEq(next.spent, first.fee + next.fee);

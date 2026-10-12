@@ -7,21 +7,22 @@ Scope: DCAToken, DCAHook, HookBase, HookFlags, and the explicit-argument salt mi
 | Surface | Restriction / assessment |
 | --- | --- |
 | Initialization | Only the immutable manager can call; callback sender must be the immutable factory. Exact token/FWA, hook, fee 12500 and spacing 60 are validated. One initialization per hook. |
-| beforeSwap / afterSwap | Only the manager; exact initialized PoolId; configured conversion route; nonzero bounded amount. Router identity and hookData do not grant privileges. |
+| beforeSwap / afterSwap | Only the manager; exact initialized PoolId; nonzero bounded amount. Trading never depends on the conversion route. Router identity and hookData do not grant privileges. |
 | Returned deltas | Fixed 5% FWA fee only. Positive specified delta is smaller than a buy's gross input; exact-output sells gross up with a signed-range check. afterSwap charges only the FWA side. No LP-fee override or full-swap substitution. |
 | Disabled callbacks | All seven reject direct callers and always revert even for the manager. Their address flags are off, so normal liquidity addition/removal and donations never invoke them. |
-| Conversion settings | Only explicit immutable owner, with reentrancy guard; validates currency order, fee, tick spacing, hook address/code, existing pool and price bounds. Emits configuration event. Owner cannot directly transfer or burn claim balances, change the fee/recipient, mint DCA, or change code. |
-| ETH redemption | Permissionless, but pays only the fixed creator. Opens manager unlock; callback checks manager and a one-use pending-redemption flag. |
+| Conversion settings | Only explicit immutable owner, with reentrancy guard; validates currency order, fee, tick spacing, hook address/code, existing pool and price bounds. Emits configuration event and resets the price anchor. Owner cannot change the fee/recipient, mint DCA, or change code; `redeemPair()` lets the owner move FWA claims only to the fixed recipient. |
+| Conversion bounds | Relative bound measured from a price observed in an earlier block (lower of anchor and spot); no sale on a fee-free swap; backlog sold per swap capped at 4x the new fee; market sale in try/catch with a 2,000,000 gas stipend. A same-block price move beyond the bound defers to claims. |
+| ETH / FWA redemption | `redeemEth()` is permissionless, `redeemPair()` owner-only; both pay only the fixed creator. Each opens a manager unlock; the callback checks the manager and a one-use pending-action flag. |
 | Ownership / upgrades | No transfer, renunciation, proxy, delegatecall, selfdestruct, pause or arbitrary execute path. Owner key availability is an operational dependency. |
 | Token | Standard ERC20 with constructor-only mint; fixed 18 decimals and 10^27 minor-unit supply to factory. Transfers and approvals use OpenZeppelin behavior. |
 
 All delta-changing operations are reached through the authenticated, guarded afterSwap or through the redemption callback while the guarded redemption entry point is active. beforeSwap returns only arithmetic deltas and does not move funds. The manager's AMM work between beforeSwap and afterSwap makes no call to an external market on the hook's behalf. afterSwap's nested conversion is protected against callback reentry.
 
-The conversion pool may have another hook. It is an owner-chosen trust dependency: price limits do not constrain arbitrary extra charges or deliberate failure by that external hook. Incorrect-sign output and overspending are rejected. A reverting or otherwise unusable route blocks swaps until configuration is repaired. External reentry into either a launch swap or redemption is tested and rejected. Recipient reentry is tested both during swap payout and during claim redemption.
+The conversion pool may have another hook. It is an owner-chosen trust dependency: price limits do not constrain arbitrary extra charges or deliberate failure by that external hook. Incorrect-sign output and overspending are rejected atomically. A reverting, uninitialized or gas-exhausting route only defers the fee to claims; trading continues. External reentry into either a launch swap or redemption is tested and rejected. Recipient reentry is tested both during swap payout and during claim redemption.
 
 ## Delta conservation
 
-Let `F` be the new FWA fee, `O` the old FWA claims burned for this conversion, `S` FWA actually sold, and `E` native ETH returned. The maximum attempted input is signed-128-bit bounded.
+Let `F` be the new FWA fee, `O` the old FWA claims burned for this conversion (`O <= 4F`), `S` FWA actually sold, and `E` native ETH returned. With `F = 0` or no market configured, `O = S = 0` and the fee (if any) is minted as a claim. The maximum attempted input is signed-128-bit bounded.
 
 | FWA operation | Hook's manager delta |
 | --- | --- |
@@ -43,7 +44,8 @@ Tests assert zero remaining deltas across all participants after unlock, fee con
 - No unbounded runtime loop in either launch contract. Claim conversion/redemption caps work to signed-128-bit values. The off-chain miner has a caller-bounded search.
 - Fees and rates operate on raw currency units; no incorrect decimal rescaling is introduced. The 18-decimal DCA supply and FWA identity come from the assignment.
 - Relative conversion price bound is rounded conservatively and combined with an explicit absolute price ceiling. Neither is represented as a fair-value oracle. LP fees, external hook fees and integer dust are separate execution costs.
-- No allowances are granted by the hook. FWA is never transferred out of the manager to it. A mock that blocks exactly that transfer is used throughout integration tests.
+- No allowances are granted by the hook. FWA is never transferred out of the manager to it. The FWA mock used throughout integration tests implements the real FWA transfer guard, which blocks exactly that transfer.
+- Sandwich resistance: a trader who pushes the market before a launch swap finds the hook's bound still anchored to the previous block, so the sale defers; a trader who wants the backlog sold must pay a fee at least a fifth of what is sold, which exceeds the bounded price slippage they could capture. Tested in `test/ConversionBounds.t.sol`.
 - Native ETH currency zero is intentional. Direct native transfers to a funded hook are unsupported; fees go directly to the recipient or remain manager claims.
 
 ## Test evidence and limitations
