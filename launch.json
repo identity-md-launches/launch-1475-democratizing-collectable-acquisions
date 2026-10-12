@@ -1,0 +1,32 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "DCAHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "$factory",
+      "$owner"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "DCAToken",
+    "name": "Democratizing Collectable Acquisitions",
+    "symbol": "DCA",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0xa0df17b5ac76ababa36e1450e2cbcd18a620c845",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Before swaps can execute, $owner must call setConversionPool with an existing native ETH/FWA pool on the same PoolManager, a relative price-move bound of 1-1000 basis points, and an absolute sqrtPriceX96 ceiling. These owner-settable conversion settings are initially unset. DCAHook charges 5% of each swap's gross FWA side for the fixed recipient 0x1ee3ffadfe138415a2ddaedeebe5f46616fa413d, in addition to the pool's 1.25% LP fee. Fees use integer division rounded down; net-specified FWA amounts are grossed up using net * 500 / 9500. The fee is charged through beforeSwapReturnDelta when FWA is the specified currency, otherwise through afterSwapReturnDelta using the actual FWA delta. Partial fills with FWA as the specified currency revert atomically. In afterSwap, new fees and pending FWA claims are sold for native ETH within the same PoolManager unlock, subject to the configured price bounds. Unsold FWA remains ERC-6909 claims for later swaps. Available ETH is sent to the fixed recipient; insufficient manager ETH or rejected payouts leave ETH claims, retried on later swaps or through permissionless redeemEth, always paying that recipient. An unusable or reverting conversion route can block swaps until the owner repairs its configuration. beforeInitialize, beforeSwap and afterSwap accept calls only from PoolManager. Initialization additionally requires $factory as sender and the exact DCA/FWA pool, fee 12500 and tick spacing 60, once per hook. The constructor validates the hook address permission bits. DCAToken has no constructor arguments and uses 18 decimals. pool.initialPrice records the required one-to-one reference value; the deployer derives the opening price from the separately versioned launch policy."
+}
