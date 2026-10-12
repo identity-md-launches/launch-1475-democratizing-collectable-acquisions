@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {HookFixture} from "./HookFixture.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {DCAHook} from "src/DCAHook.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {Position} from "v4-core/src/libraries/Position.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId} from "v4-core/src/types/PoolId.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
+
+contract LifecycleRejectEth {
+    receive() external payable {
+        revert("recipient unavailable");
+    }
+}
+
+/// @dev Targets real PoolManager operations. The hook and manager are never storage-mocked.
+/// Pair fees are measured from trader balances and raw launch-pool deltas; conversion amounts
+/// come from the unhooked conversion pools' own Swap events, not DCAHook's accounting events.
+contract ClaimLifecycleHandler is HookFixture {
+    using StateLibrary for IPoolManager;
+
+    address[3] public traders;
+    PoolKey[2] private markets;
+    uint256[2] public marketLiquidity;
+    uint256 public activeMarket;
+    uint256 public feesCharged;
+    uint256 public pairDonated;
+    uint256 public pairConverted;
+    uint256 public ethEarned;
+    uint256 public ethDonated;
+    uint256 public pairRedeemed;
+    uint256 public successfulTrades;
+    uint256 public hookSales;
+    uint256 public deferredSales;
+    uint256 public marketMoves;
+    /// @dev Ghost model of the anchor ratchet: the anchor the hook last reported, the block it last
+    /// changed in, the price the owner last configured at, and how many promotions were seen.
+    uint256 public lastAnchor;
+    uint256 public lastAnchorBlock;
+    uint256 public configuredPrice;
+    uint256 public anchorPromotions;
+    bytes private rejectCode;
+
+    constructor() {
+        _deploy(true, true, false);
+        configuredPrice = Q96;
+        rejectCode = address(new LifecycleRejectEth()).code;
+        markets[0] = market;
+        marketLiquidity[0] = MARKET_LIQUIDITY;
+        PoolKey memory alternative = market;
+        alternative.fee = 500;
+        manager.initialize(alternative, Q96);
+        router.modifyLiquidity{value: MARKET_LIQUIDITY}(
+            alternative, _liquidity(MARKET_LIQUIDITY), MARKET_LIQUIDITY, MARKET_LIQUIDITY
+        );
+        markets[1] = alternative;
+        marketLiquidity[1] = MARKET_LIQUIDITY;
+        for (uint256 i; i < traders.length; ++i) {
+            address trader = makeAddr(string.concat("claim lifecycle trader ", vm.toString(i)));
+            traders[i] = trader;
+            token.transfer(trader, 1_000_000 ether);
+            pair.transfer(trader, 1_000_000 ether);
+            vm.deal(trader, 1000 ether);
+            vm.startPrank(trader);
+            token.approve(address(router), type(uint256).max);
+            pair.approve(address(router), type(uint256).max);
+            vm.stopPrank();
+        }
+    }
+
+    function trade(uint8 actorSeed, bool buy, bool exactInput, uint96 raw, bool nativeUnavailable) external {
+        _tradeAs(
+            traders[actorSeed % 3], buy, exactInput, bound(uint256(raw), 1, 100 ether), nativeUnavailable
+        );
+    }
+
+    function _tradeAs(address trader, bool buy, bool exactInput, uint256 amount, bool nativeUnavailable)
+        private
+    {
+        uint256 pairBefore = pair.balanceOf(trader);
+        uint256 tokenBefore = token.balanceOf(trader);
+        vm.recordLogs();
+        vm.prank(trader);
+        BalanceDelta delta;
+        if (nativeUnavailable) {
+            delta = router.drainAndSwap(key, _params(buy, exactInput, amount), amount * 4 + 100, 0);
+        } else {
+            delta = router.swap(key, _params(buy, exactInput, amount), amount * 4 + 100, 0);
+        }
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        _accountTrade(trader, buy, pairBefore, tokenBefore, delta, logs);
+        _recordConversions(logs);
+        _checkAnchorStep();
+        ++successfulTrades;
+    }
+
+    /// @dev Only a trade can move the anchor. When it does, the first anchor after a configuration is
+    /// exactly the price configured at (nothing traded in the configuration block can seed it), a
+    /// later one is at most one bound step above the previous anchor (a fall is unbounded), and the
+    /// anchor changes at most once per block.
+    function _checkAnchorStep() private {
+        uint256 anchor = hook.anchorSqrtPriceX96();
+        if (anchor == lastAnchor) return;
+        if (lastAnchor == 0) {
+            assertEq(anchor, configuredPrice, "first anchor is not the configured price");
+        } else {
+            assertGt(vm.getBlockNumber(), lastAnchorBlock, "anchor changed twice in one block");
+            uint256 factor = Math.sqrt((10_000 + uint256(hook.maxPriceMoveBps())) * 1e18 / 10_000);
+            assertLe(anchor, FullMath.mulDiv(lastAnchor, factor, 1e9), "anchor rose more than one step");
+        }
+        lastAnchor = anchor;
+        lastAnchorBlock = vm.getBlockNumber();
+        ++anchorPromotions;
+    }
+
+    /// @dev Configuring resets the anchor; the next promotion must reproduce the price seen here.
+    function _configureTracked(uint16 bps, uint160 ceiling) private {
+        (uint160 price,,,) = manager.getSlot0(market.toId());
+        _configure(bps, ceiling);
+        assertEq(hook.anchorSqrtPriceX96(), 0, "configuration must reset the anchor");
+        assertEq(hook.observedSqrtPriceX96(), price, "configuration observes the current price");
+        configuredPrice = price;
+        lastAnchor = 0;
+    }
+
+    function assertAnchorModel() external view {
+        assertEq(hook.anchorSqrtPriceX96(), lastAnchor, "anchor changed outside a trade or configuration");
+        if (lastAnchor == 0) {
+            assertEq(hook.observedSqrtPriceX96(), configuredPrice, "configuration block recorded a spot");
+        }
+    }
+
+    function _accountTrade(
+        address trader,
+        bool buy,
+        uint256 pairBefore,
+        uint256 tokenBefore,
+        BalanceDelta delta,
+        Vm.Log[] memory logs
+    ) private {
+        Outcome memory o = _outcome(logs, delta);
+        int256 paidPair = int256(pairBefore) - int256(pair.balanceOf(trader));
+        int256 fee = int256(o.rawPair) + paidPair;
+        assertGe(fee, 0);
+        uint256 gross = buy ? uint256(paidPair) : uint256(int256(o.rawPair));
+        assertLe(uint256(fee) * 20, gross);
+        assertLt(gross, (uint256(fee) + 1) * 20);
+        assertEq(int256(token.balanceOf(trader)) - int256(tokenBefore), int256(o.rawToken));
+        assertEq(int256(_pairDelta(delta)), -paidPair);
+        feesCharged += uint256(fee);
+    }
+
+    /// @dev Every Swap event on the configured market inside a launch trade is the hook's own sale:
+    /// traders move the market only through `moveMarket`, outside these logs. Each sale must end at
+    /// or below the owner's bound measured from the anchor the hook promoted in an earlier block,
+    /// and below the absolute ceiling, whatever same-block manipulation preceded it.
+    function _recordConversions(Vm.Log[] memory logs) private {
+        bool sold;
+        for (uint256 i; i < logs.length; ++i) {
+            if (
+                logs[i].emitter != address(manager) || logs[i].topics[0] != SWAP_TOPIC
+                    || logs[i].topics[1] != PoolId.unwrap(market.toId())
+            ) continue;
+            (int128 ethDelta, int128 pairDelta, uint160 priceAfter,,,) =
+                abi.decode(logs[i].data, (int128, int128, uint160, uint128, int24, uint24));
+            assertGe(ethDelta, 0);
+            assertLe(pairDelta, 0);
+            pairConverted += uint256(-int256(pairDelta));
+            ethEarned += uint256(int256(ethDelta));
+            uint256 anchor = hook.anchorSqrtPriceX96();
+            assertGt(anchor, 0, "a sale ran without an earlier-block anchor");
+            uint256 factor = Math.sqrt((10_000 + uint256(hook.maxPriceMoveBps())) * 1e18 / 10_000);
+            assertLe(priceAfter, FullMath.mulDiv(anchor, factor, 1e9), "sale moved past the relative bound");
+            assertLe(priceAfter, hook.maxConversionSqrtPriceX96(), "sale moved past the absolute ceiling");
+            sold = true;
+        }
+        if (sold) ++hookSales;
+        else ++deferredSales;
+    }
+
+    /// @dev A trader moves the configured market directly, in either direction, as a manipulator
+    /// would before or after a launch trade. Blocks advance only through `roll`, so a move may sit
+    /// in the same block as the next trade or in an earlier one.
+    function moveMarket(uint8 actorSeed, bool pushFwaCheaper, uint96 raw) external {
+        // An empty market has nothing to trade against and would only pin the price at a bound,
+        // where v4 refuses a further move in that direction. Keep moves within the seeded range.
+        if (marketLiquidity[activeMarket] == 0) return;
+        (uint160 spot,,,) = manager.getSlot0(market.toId());
+        if (pushFwaCheaper ? spot > uint256(Q96) * 4 : spot < uint256(Q96) / 4) return;
+        address trader = traders[actorSeed % 3];
+        SwapParams memory params;
+        uint256 amount;
+        if (pushFwaCheaper) {
+            // Selling FWA for ETH raises sqrt(FWA/ETH): the direction the hook's own sale moves.
+            amount = bound(uint256(raw), 1 ether, 10_000 ether);
+            params = SwapParams(false, -int256(amount), TickMath.MAX_SQRT_PRICE - 1);
+            vm.prank(trader);
+            router.swap(market, params, amount, 0);
+        } else {
+            amount = bound(uint256(raw), 0.01 ether, 10 ether);
+            params = SwapParams(true, -int256(amount), TickMath.MIN_SQRT_PRICE + 1);
+            vm.prank(trader);
+            router.swap{value: amount}(market, params, amount, 0);
+        }
+        ++marketMoves;
+    }
+
+    function roll(uint8 blocks) external {
+        vm.roll(vm.getBlockNumber() + bound(uint256(blocks), 1, 4));
+    }
+
+    /// @dev The owner's FWA exit. It pays the fixed recipient only, needs FWA's guard to allow the
+    /// manager-to-recipient transfer, and refuses to run with nothing to pay.
+    function redeemPair(bool recipientAllowed) external {
+        pair.setDistributor(CREATOR, recipientAllowed);
+        uint256 claims = manager.balanceOf(address(hook), uint160(FWA));
+        uint256 recipientBefore = pair.balanceOf(CREATOR);
+        uint256 ownerEthBefore = CREATOR.balance;
+        if (claims == 0) {
+            vm.prank(CREATOR);
+            vm.expectRevert(DCAHook.NothingToRedeem.selector);
+            hook.redeemPair();
+            return;
+        }
+        if (!recipientAllowed) {
+            vm.prank(CREATOR);
+            vm.expectRevert();
+            hook.redeemPair();
+            assertEq(manager.balanceOf(address(hook), uint160(FWA)), claims, "rejected exit lost claims");
+            return;
+        }
+        uint256 expected = Math.min(claims, uint256(uint128(type(int128).max)));
+        vm.prank(CREATOR);
+        hook.redeemPair();
+        assertEq(pair.balanceOf(CREATOR), recipientBefore + expected, "exit paid the wrong FWA amount");
+        assertEq(manager.balanceOf(address(hook), uint160(FWA)), claims - expected);
+        assertEq(CREATOR.balance, ownerEthBefore, "pair exit must not touch ETH");
+        pairRedeemed += expected;
+    }
+
+    function configure(uint8 marketSeed, uint16 rawBps, bool defer) external {
+        activeMarket = marketSeed % 2;
+        market = markets[activeMarket];
+        (uint160 price,,,) = manager.getSlot0(market.toId());
+        _configureTracked(uint16(bound(rawBps, 1, 1000)), defer ? price : price + price / 5);
+    }
+
+    function resizeConversionLiquidity(uint8 mode) external {
+        uint256 target = mode % 3 == 0 ? 0 : (mode % 3 == 1 ? MARKET_LIQUIDITY / 2 : MARKET_LIQUIDITY);
+        _resizeMarket(target);
+    }
+
+    function _resizeMarket(uint256 target) private {
+        uint256 current = marketLiquidity[activeMarket];
+        ModifyLiquidityParams memory params = _liquidity(0);
+        params.liquidityDelta = int256(target) - int256(current);
+        // Poking an empty position is invalid in v4; test the exact refusal on repeated removal.
+        if (current == 0 && target == 0) {
+            vm.expectRevert(Position.CannotUpdateEmptyPosition.selector);
+            router.modifyLiquidity(market, params, 0, 0);
+            return;
+        }
+        uint256 budget0;
+        uint256 budget1;
+        if (target > current) {
+            (uint160 price,,,) = manager.getSlot0(market.toId());
+            uint160 lower = TickMath.getSqrtPriceAtTick(params.tickLower);
+            uint160 upper = TickMath.getSqrtPriceAtTick(params.tickUpper);
+            uint160 clamped = price < lower ? lower : (price > upper ? upper : price);
+            uint128 added = uint128(target - current);
+            budget0 = SqrtPriceMath.getAmount0Delta(clamped, upper, added, true);
+            budget1 = SqrtPriceMath.getAmount1Delta(lower, clamped, added, true);
+        }
+        router.modifyLiquidity{value: budget0}(market, params, budget0, budget1);
+        marketLiquidity[activeMarket] = target;
+    }
+
+    function donateClaims(uint8 actorSeed, bool native, uint96 raw) external {
+        uint256 amount = bound(uint256(raw), 1, 2 ether);
+        vm.prank(traders[actorSeed % 3]);
+        if (native) {
+            router.mintClaims{value: amount}(Currency.wrap(address(0)), amount, address(hook));
+            ethDonated += amount;
+        } else {
+            router.mintClaims(Currency.wrap(FWA), amount, address(hook));
+            pairDonated += amount;
+        }
+    }
+
+    function recipientAcceptsEth(bool accepts) external {
+        vm.etch(CREATOR, accepts ? bytes("") : rejectCode);
+    }
+
+    function redeem(uint8 actorSeed) external {
+        address caller = traders[actorSeed % 3];
+        uint256 callerBefore = caller.balance;
+        uint256 entitlement = CREATOR.balance + manager.balanceOf(address(hook), 0);
+        vm.prank(caller);
+        hook.redeemEth();
+        assertEq(CREATOR.balance + manager.balanceOf(address(hook), 0), entitlement);
+        assertEq(caller.balance, callerBefore, "permissionless caller cannot take creator fees");
+        uint256 paid = CREATOR.balance;
+        uint256 pending = manager.balanceOf(address(hook), 0);
+        vm.prank(caller);
+        hook.redeemEth();
+        assertEq(CREATOR.balance, paid, "redemption replay paid twice");
+        assertEq(manager.balanceOf(address(hook), 0), pending);
+    }
+
+    function rejectUnauthorizedConfiguration(uint8 actorSeed) external {
+        uint16 bps = hook.maxPriceMoveBps();
+        uint160 ceiling = hook.maxConversionSqrtPriceX96();
+        vm.prank(traders[actorSeed % 3]);
+        vm.expectRevert(DCAHook.OnlyOwner.selector);
+        hook.setConversionPool(market, 1, Q96);
+        assertEq(hook.maxPriceMoveBps(), bps);
+        assertEq(hook.maxConversionSqrtPriceX96(), ceiling);
+    }
+
+    function assertClaimsConserved() external view {
+        assertEq(
+            feesCharged + pairDonated,
+            pairConverted + pairRedeemed + manager.balanceOf(address(hook), uint160(FWA))
+        );
+        assertEq(pair.balanceOf(CREATOR), pairRedeemed, "recipient holds exactly the owner-exited FWA");
+        assertEq(ethEarned + ethDonated, CREATOR.balance + manager.balanceOf(address(hook), 0));
+        assertGe(pair.balanceOf(address(manager)), manager.balanceOf(address(hook), uint160(FWA)));
+        assertGe(address(manager).balance, manager.balanceOf(address(hook), 0));
+    }
+
+    function assertSupplyAndSettlement() external view {
+        uint256 tokenSum = token.balanceOf(address(this)) + token.balanceOf(address(manager));
+        uint256 pairSum =
+            pair.balanceOf(address(this)) + pair.balanceOf(address(manager)) + pair.balanceOf(CREATOR);
+        for (uint256 i; i < traders.length; ++i) {
+            tokenSum += token.balanceOf(traders[i]);
+            pairSum += pair.balanceOf(traders[i]);
+        }
+        assertEq(tokenSum, 1_000_000_000 ether);
+        assertEq(token.totalSupply(), tokenSum);
+        assertEq(pairSum, pair.totalSupply());
+        assertEq(pair.balanceOf(address(hook)), 0);
+        assertEq(token.balanceOf(address(hook)), 0);
+        assertEq(pair.balanceOf(address(router)), 0);
+        assertEq(token.balanceOf(address(router)), 0);
+        assertEq(address(router).balance, 0);
+        assertEq(address(hook).balance, 0);
+        assertEq(hook.RECIPIENT(), CREATOR);
+        assertEq(hook.FEE_BPS(), 500);
+        assertEq(hook.owner(), CREATOR);
+        assertEq(PoolId.unwrap(hook.launchPoolId()), PoolId.unwrap(key.toId()));
+        assertTrue(hook.initialized());
+        _assertSettled();
+    }
+
+    /// @dev End-of-campaign liveness: after restoring recipient, liquidity and limits, ordinary
+    /// trades in fresh blocks must drain the backlog at the capped pace (each sells its own fee plus
+    /// at most BACKLOG_MULTIPLE times it), and whatever a bounded number of trades leaves must be
+    /// recoverable through the owner's exit. Nothing accumulated may be stranded.
+    function finishAndCheckRecovery() external {
+        vm.etch(CREATOR, "");
+        _resizeMarket(MARKET_LIQUIDITY);
+        (uint160 price,,,) = manager.getSlot0(market.toId());
+        _configureTracked(1000, price * 2);
+        uint256 backlog = manager.balanceOf(address(hook), uint160(FWA));
+        for (uint256 i; i < 12 && manager.balanceOf(address(hook), uint160(FWA)) != 0; ++i) {
+            uint256 before = manager.balanceOf(address(hook), uint160(FWA));
+            _tradeAs(traders[i % 3], true, true, 100 ether, false);
+            uint256 remaining = manager.balanceOf(address(hook), uint160(FWA));
+            assertLt(remaining, before + 5 ether, "a trade in a fresh block must sell at least its own fee");
+            if (remaining != 0) {
+                assertGe(before - remaining, 4 * 4 ether, "backlog drains at the capped pace");
+            }
+            vm.roll(vm.getBlockNumber() + 1);
+        }
+        uint256 left = manager.balanceOf(address(hook), uint160(FWA));
+        if (left != 0) {
+            assertGt(backlog, 12 * 20 ether, "a small backlog must clear through trades alone");
+            this.redeemPair(true);
+        }
+        hook.redeemEth();
+        assertEq(manager.balanceOf(address(hook), uint160(FWA)), 0, "pair claims cannot be recovered");
+        assertEq(manager.balanceOf(address(hook), 0), 0, "ETH claims cannot be recovered");
+    }
+}
