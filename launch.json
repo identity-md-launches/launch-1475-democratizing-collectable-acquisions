@@ -1,0 +1,32 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "DCAHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "$factory",
+      "$owner"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "DCAToken",
+    "name": "Democratizing Collectable Acquisions",
+    "symbol": "DCA",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0xa0df17b5ac76ababa36e1450e2cbcd18a620c845",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "DCAHook charges 5% (500 bps, rounded down) of the gross FWA side of every swap in its launch pool for the fixed recipient 0x1ee3ffadfe138415a2ddaedeebe5f46616fa413d, the pool creator's wallet, on top of the pool's 1.25% LP fee (12500), which the hook never overrides. When FWA is the specified currency (exact-input buy, exact-output sell) the fee is a positive specified delta returned by beforeSwap through beforeSwapReturnDelta; exact-output amounts are grossed up by net * 500 / 9500. Otherwise afterSwap charges 5% of the actual FWA delta through afterSwapReturnDelta. A partial fill with FWA specified reverts atomically (PartialFillNotSupported); a DCA-specified partial fill pays 5% of the FWA actually exchanged. DCA is never charged. Trading never depends on the conversion route: from the launch block every swap pays its fee, and until the owner configures a market the FWA stays as ERC-6909 claims owned by the hook. Once the owner has called setConversionPool with an initialized native ETH/FWA pool on the same PoolManager, a per-block price-move bound (1-1000 bps, measured from a price observed in an earlier block) and an absolute sqrtPriceX96 ceiling, afterSwap sells the new fee plus at most four times that fee of older FWA claims exact-input for native ETH on that pool inside the same PoolManager unlock, within those bounds. The sale runs in try/catch with a 2,000,000 gas stipend, so a reverting, uninitialized or gas-exhausting market defers the fee to claims instead of blocking the swap. Unsold FWA is minted back as claims. ETH is paid at once to the fixed recipient up to the manager's native balance; a shortfall (a pool seeded with tokens only) or a recipient that rejects ETH leaves ETH claims, retried on later swaps or by permissionless redeemEth(), which pays only that recipient. Owner-only redeemPair() burns FWA claims and takes the FWA from the manager straight to the recipient, never to the hook. Constructor, in declaration order: IPoolManager manager ($poolManager), address launchToken ($token), address launchFactory ($factory), address initialOwner ($owner, the named owner 0x1ee3ffadfe138415a2ddaedeebe5f46616fa413d). It rejects zero addresses, validates the address permission bits and makes no external calls. The owner can only call setConversionPool and redeemPair; fee, recipient and launch pool are immutable and ownership cannot be transferred. beforeInitialize, beforeSwap, afterSwap and unlockCallback accept only PoolManager; the seven disabled callbacks revert. beforeInitialize additionally requires $factory as sender and the exact DCA/FWA pool with fee 12500, tick spacing 60 and this hook, once per hook, and returns its selector. FWA's transfer guard lets the PoolManager move FWA only for FWA's own hook, so trading the launch pool needs a router that is an FWA distributor or that keeps the FWA leg as ERC-6909 claims; the hook's own fee path holds FWA only as claims and sells it on FWA's canonical pool. DCAToken is a plain OpenZeppelin ERC-20 with no constructor arguments and 18 decimals; its name keeps the brief's exact spelling, Acquisions. pool.initialPrice is the reference one-to-one value; the deployer derives the opening price from the launch policy's opening market cap and the token's address."
+}
