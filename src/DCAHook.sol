@@ -53,7 +53,8 @@ contract DCAHook is HookBase, IUnlockCallback, ReentrancyGuard {
     uint16 public maxPriceMoveBps;
     uint160 public maxConversionSqrtPriceX96;
     /// @dev Reference sqrt price for the relative bound: observed in an earlier block, so no
-    /// same-block caller can set it. Zero until a sale has been attempted in a later block.
+    /// same-block caller can set it, and ratcheted so it rises by at most maxPriceMoveBps per
+    /// promotion. Zero until a sale has been attempted in a block after configuration.
     uint160 public anchorSqrtPriceX96;
     uint160 public observedSqrtPriceX96;
     uint64 public observedBlock;
@@ -310,11 +311,9 @@ contract DCAHook is HookBase, IUnlockCallback, ReentrancyGuard {
         (uint160 price,,,) = poolManager.getSlot0(market.toId());
         uint160 base = _referencePrice(price);
         if (base == 0 || price >= maxConversionSqrtPriceX96) return (0, 0);
-        // price is FWA/ETH. Selling FWA increases sqrt(price). sqrt(1 + bps/10000) is evaluated
-        // with 1e9 precision and rounded down, tightening the bound. A spot price already more
-        // than the bound above the reference means the market moved this block: defer.
-        uint256 factor = Math.sqrt((BPS + maxPriceMoveBps) * 1e18 / BPS);
-        uint160 limit = Math.min(FullMath.mulDiv(base, factor, 1e9), maxConversionSqrtPriceX96).toUint160();
+        // price is FWA/ETH. Selling FWA increases sqrt(price). A spot price already more than the
+        // bound above the reference means the market moved this block: defer.
+        uint160 limit = Math.min(_oneStepAbove(base), maxConversionSqrtPriceX96).toUint160();
         if (limit <= price) return (0, 0);
         // A reverting or gas-exhausting market only defers the sale; it never blocks trading.
         try poolManager.swap{gas: CONVERSION_GAS}(
@@ -331,13 +330,32 @@ contract DCAHook is HookBase, IUnlockCallback, ReentrancyGuard {
         }
     }
 
-    /// @dev The anchor is the market price observed by the last sale attempt in an earlier block.
-    /// The base is the lower of anchor and spot: a lowered spot only tightens the bound.
+    /// @dev sqrt(1 + maxPriceMoveBps/10000) times `base`, evaluated with 1e9 precision and rounded
+    /// down, which tightens every bound derived from it.
+    function _oneStepAbove(uint160 base) private view returns (uint256) {
+        return FullMath.mulDiv(base, Math.sqrt((BPS + maxPriceMoveBps) * 1e18 / BPS), 1e9);
+    }
+
+    /// @dev The anchor follows the market price observed by the last sale attempt in an earlier
+    /// block, but may rise by at most one bound step per promotion: a price pushed up and held across
+    /// a block boundary moves the reference by maxPriceMoveBps, not to the manipulated spot. Falling
+    /// is adopted at once, since a lower reference only tightens the sale. The first anchor after
+    /// configuration is the price the owner configured at; sale attempts in the configuration block
+    /// do not record spot, so a back-run of the setter cannot seed it either. The base is the lower
+    /// of anchor and spot.
     function _referencePrice(uint160 price) private returns (uint160) {
-        if (observedBlock < block.number) anchorSqrtPriceX96 = observedSqrtPriceX96;
-        observedSqrtPriceX96 = price;
-        observedBlock = uint64(block.number);
         uint160 anchor = anchorSqrtPriceX96;
+        if (observedBlock < block.number) {
+            uint160 observed = observedSqrtPriceX96;
+            anchor = anchor == 0 || observed <= anchor
+                ? observed
+                : Math.min(uint256(observed), _oneStepAbove(anchor)).toUint160();
+            anchorSqrtPriceX96 = anchor;
+        }
+        if (anchor != 0) {
+            observedSqrtPriceX96 = price;
+            observedBlock = uint64(block.number);
+        }
         return anchor < price ? anchor : price;
     }
 

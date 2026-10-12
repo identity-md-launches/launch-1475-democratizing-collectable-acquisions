@@ -7,11 +7,11 @@ Toolchain: Foundry 1.8.3 (`cae51ad458f6abb64852b7709eb784352429825d`), Solidity 
 | Check | Result |
 | --- | --- |
 | `forge build` | Pass. Foundry lint diagnostics about guarded callbacks/events and the unused empty unlock response were reviewed in SECURITY.md. |
-| `forge test` | **58 reported passes**, zero failures, zero skips, across seven suites (plus the reviewer's proof `Proof_dfa2af182d0a.t.sol`, which passes when copied under `test/scratch/`). |
+| `forge test` | **62 reported passes**, zero failures, zero skips, across seven suites. The round-3 reviewer's cross-block anchor proof (finding `e68c2cbaa4ce…`) was reproduced under `test/scratch/` against the previous code (anchor promoted to 1.8×Q96, 6,250 FWA sold, attacker +965.56 FWA) and passes against the ratcheted anchor (anchor 1.0488×Q96, 6,250 FWA + 1 wei of claims kept, creator ETH untouched, attacker −3,366.50 FWA). |
 | `forge fmt --check` | Pass, no formatting diff. |
 | Clean offline copy, `forge build --offline` | Pass with only src/test/script/lib and root configuration, no read inputs, scratch files, existing cache or artifacts. |
-| Clean-copy `forge test --offline` | **58 reported passes**, zero failures, zero skips, with an empty environment apart from PATH. |
-| Production bytecode artifacts | No creation/runtime library link references. DCAHook: **12,864 runtime bytes**; DCAToken: **1,723 runtime bytes**. Both below 24,576 bytes. |
+| Clean-copy `forge test --offline` | **62 reported passes**, zero failures, zero skips, with an empty environment apart from PATH. |
+| Production bytecode artifacts | No creation/runtime library link references. DCAHook: **12,986 runtime bytes**; DCAToken: **1,723 runtime bytes**. Both below 24,576 bytes. |
 | Runtime opcode tests | Neither launch contract contains DELEGATECALL, SELFDESTRUCT or CALLCODE outside PUSH data. |
 | Dependency tree inspection | Ordinary files only; no symlinks, submodules, environment files, node_modules or Git/GitHub directories were added under source/dependency paths. |
 
