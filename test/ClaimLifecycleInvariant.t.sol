@@ -35,10 +35,18 @@ contract ClaimLifecycleInvariantTest is Test {
         handler.assertSupplyAndSettlement();
     }
 
+    /// @dev The anchor the hook reports is the one the handler saw it promote: it only moves inside
+    /// a trade, the first value after a configuration is the configured price, each later promotion
+    /// lifts it by at most one bound step, and it changes at most once per block.
+    function invariant_anchorFollowsTheRatchetModel() public view {
+        handler.assertAnchorModel();
+    }
+
     function afterInvariant() public {
         handler.finishAndCheckRecovery();
         handler.assertClaimsConserved();
         handler.assertSupplyAndSettlement();
+        handler.assertAnchorModel();
     }
 
     function test_sequenceEmptyMarketSwitchRejectedPayoutAndRecovery() public {
@@ -59,18 +67,24 @@ contract ClaimLifecycleInvariantTest is Test {
     }
 
     /// @dev A manipulator moves the market above the bound in one block, a trade in the next block
-    /// must defer (its anchor predates the move), and the block after that sells from the promoted
-    /// anchor. The owner's exit then clears what was deferred, paying FWA to the recipient only.
+    /// must defer (its anchor predates the move), and the block after that sells from the anchor
+    /// promoted one step towards the move. The owner's exit then clears what was deferred, paying
+    /// FWA to the recipient only.
     function test_sequenceMultiBlockManipulationDefersThenRecoversAndOwnerExits() public {
         handler.trade(0, true, true, 100 ether, false);
         assertEq(handler.hookSales(), 1);
-        handler.moveMarket(1, true, 10_000 ether);
+        assertEq(handler.anchorPromotions(), 1, "the first trade promotes the configured price");
+        // 6,000 FWA into a 100,000-deep market lifts sqrt price about 6%: over one step (4.88%),
+        // under the bound from one step up (10%).
+        handler.moveMarket(1, true, 6_000 ether);
         handler.roll(1);
         handler.trade(2, true, true, 100 ether, false);
         assertEq(handler.deferredSales(), 1, "stale anchor below the moved spot must defer");
+        assertEq(handler.anchorPromotions(), 1, "the anchor predates the move");
         handler.roll(1);
         handler.trade(0, false, false, 100 ether, false);
-        assertEq(handler.hookSales(), 2, "promoted anchor allows the next block's sale");
+        assertEq(handler.anchorPromotions(), 2, "one capped promotion");
+        assertEq(handler.hookSales(), 2, "one step towards the move already clears spot");
         handler.moveMarket(2, false, 5 ether);
         handler.trade(1, true, true, 100 ether, false);
         assertEq(handler.hookSales(), 3, "a lowered spot only tightens the bound");

@@ -43,10 +43,17 @@ contract ClaimLifecycleHandler is HookFixture {
     uint256 public hookSales;
     uint256 public deferredSales;
     uint256 public marketMoves;
+    /// @dev Ghost model of the anchor ratchet: the anchor the hook last reported, the block it last
+    /// changed in, the price the owner last configured at, and how many promotions were seen.
+    uint256 public lastAnchor;
+    uint256 public lastAnchorBlock;
+    uint256 public configuredPrice;
+    uint256 public anchorPromotions;
     bytes private rejectCode;
 
     constructor() {
         _deploy(true, true, false);
+        configuredPrice = Q96;
         rejectCode = address(new LifecycleRejectEth()).code;
         markets[0] = market;
         marketLiquidity[0] = MARKET_LIQUIDITY;
@@ -93,7 +100,44 @@ contract ClaimLifecycleHandler is HookFixture {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         _accountTrade(trader, buy, pairBefore, tokenBefore, delta, logs);
         _recordConversions(logs);
+        _checkAnchorStep();
         ++successfulTrades;
+    }
+
+    /// @dev Only a trade can move the anchor. When it does, the first anchor after a configuration is
+    /// exactly the price configured at (nothing traded in the configuration block can seed it), a
+    /// later one is at most one bound step above the previous anchor (a fall is unbounded), and the
+    /// anchor changes at most once per block.
+    function _checkAnchorStep() private {
+        uint256 anchor = hook.anchorSqrtPriceX96();
+        if (anchor == lastAnchor) return;
+        if (lastAnchor == 0) {
+            assertEq(anchor, configuredPrice, "first anchor is not the configured price");
+        } else {
+            assertGt(vm.getBlockNumber(), lastAnchorBlock, "anchor changed twice in one block");
+            uint256 factor = Math.sqrt((10_000 + uint256(hook.maxPriceMoveBps())) * 1e18 / 10_000);
+            assertLe(anchor, FullMath.mulDiv(lastAnchor, factor, 1e9), "anchor rose more than one step");
+        }
+        lastAnchor = anchor;
+        lastAnchorBlock = vm.getBlockNumber();
+        ++anchorPromotions;
+    }
+
+    /// @dev Configuring resets the anchor; the next promotion must reproduce the price seen here.
+    function _configureTracked(uint16 bps, uint160 ceiling) private {
+        (uint160 price,,,) = manager.getSlot0(market.toId());
+        _configure(bps, ceiling);
+        assertEq(hook.anchorSqrtPriceX96(), 0, "configuration must reset the anchor");
+        assertEq(hook.observedSqrtPriceX96(), price, "configuration observes the current price");
+        configuredPrice = price;
+        lastAnchor = 0;
+    }
+
+    function assertAnchorModel() external view {
+        assertEq(hook.anchorSqrtPriceX96(), lastAnchor, "anchor changed outside a trade or configuration");
+        if (lastAnchor == 0) {
+            assertEq(hook.observedSqrtPriceX96(), configuredPrice, "configuration block recorded a spot");
+        }
     }
 
     function _accountTrade(
@@ -208,7 +252,7 @@ contract ClaimLifecycleHandler is HookFixture {
         activeMarket = marketSeed % 2;
         market = markets[activeMarket];
         (uint160 price,,,) = manager.getSlot0(market.toId());
-        _configure(uint16(bound(rawBps, 1, 1000)), defer ? price : price + price / 5);
+        _configureTracked(uint16(bound(rawBps, 1, 1000)), defer ? price : price + price / 5);
     }
 
     function resizeConversionLiquidity(uint8 mode) external {
@@ -327,7 +371,7 @@ contract ClaimLifecycleHandler is HookFixture {
         vm.etch(CREATOR, "");
         _resizeMarket(MARKET_LIQUIDITY);
         (uint160 price,,,) = manager.getSlot0(market.toId());
-        _configure(1000, price * 2);
+        _configureTracked(1000, price * 2);
         uint256 backlog = manager.balanceOf(address(hook), uint160(FWA));
         for (uint256 i; i < 12 && manager.balanceOf(address(hook), uint160(FWA)) != 0; ++i) {
             uint256 before = manager.balanceOf(address(hook), uint160(FWA));

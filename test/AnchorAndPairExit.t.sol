@@ -42,10 +42,11 @@ contract AnchorAndPairExitTest is HookFixture, IUnlockCallback {
         assertEq(_spot(), target);
     }
 
-    /// @dev A move that landed in an earlier block is not trusted until a later attempt observes it:
-    /// the first trade after the move defers, the next block sells from the promoted anchor and
-    /// stays within the bound measured from it.
-    function test_moveInAnEarlierBlockDefersOnceThenPromotesTheObservedPrice() public {
+    /// @dev A move that landed in an earlier block is never adopted wholesale: the first trade after
+    /// it defers, and each later block's attempt lifts the anchor by one bound step (sqrt(1.1), about
+    /// 4.88% in sqrt terms) towards the observed price, never past it. A 12% sqrt move therefore
+    /// takes two promotions before the bound clears spot and the backlog sells again.
+    function test_moveInAnEarlierBlockDefersThenRatchetsTheAnchorOneStepPerBlock() public {
         // The anchor is the spot an attempt sees before its own sale, not the price it leaves.
         uint160 observed = _spot();
         Outcome memory first = _trade(true, true, 100 ether);
@@ -60,11 +61,79 @@ contract AnchorAndPairExitTest is HookFixture, IUnlockCallback {
         assertEq(hook.anchorSqrtPriceX96(), observed, "anchor is the price the last attempt saw");
         assertEq(hook.observedSqrtPriceX96(), moved);
         assertEq(deferred.pending, first.fee + deferred.fee - first.spent);
+        // Next block: one step up, not the observed 12%; the bound from it is still below spot.
         vm.roll(vm.getBlockNumber() + 1);
+        uint256 stepOne = FullMath.mulDiv(observed, _factor(1000), 1e9);
+        Outcome memory second = _trade(true, true, 100 ether);
+        assertEq(hook.anchorSqrtPriceX96(), stepOne, "the promotion is capped at one step");
+        assertLt(stepOne, moved);
+        assertEq(second.spent, 0, "the bound from one step up is still below the moved spot");
+        assertEq(hook.observedSqrtPriceX96(), moved, "the held spot is observed again");
+        assertEq(second.pending, deferred.pending + second.fee);
+        // Next block: a second step. The bound from it (about 15.4%) clears the 12% move: sell.
+        vm.roll(vm.getBlockNumber() + 1);
+        uint256 stepTwo = FullMath.mulDiv(stepOne, _factor(1000), 1e9);
         Outcome memory sold = _trade(true, true, 100 ether);
-        assertEq(hook.anchorSqrtPriceX96(), moved, "the next block promotes the observed price");
-        assertEq(sold.spent, sold.fee + deferred.pending, "backlog within the cap sells with the fee");
+        assertEq(hook.anchorSqrtPriceX96(), stepTwo, "a second single step");
+        assertLt(stepTwo, moved, "the anchor still trails the moved spot");
+        assertEq(sold.spent, sold.fee + second.pending, "backlog within the cap sells with the fee");
+        assertLe(uint256(_spot()), FullMath.mulDiv(stepTwo, _factor(1000), 1e9), "bounded from the anchor");
         assertLe(uint256(_spot()), FullMath.mulDiv(moved, _factor(1000), 1e9));
+        // Next block: the observed spot is now within one step, so the anchor catches up exactly.
+        vm.roll(vm.getBlockNumber() + 1);
+        _trade(false, true, 100 ether);
+        assertEq(hook.anchorSqrtPriceX96(), moved, "within a step the observed price is adopted exactly");
+        _assertSettled();
+    }
+
+    /// @dev A dip held across a block boundary is adopted in full, so a manipulator who buys FWA,
+    /// records the dip with a 20 wei fee-bearing trade and restores the market one block later pins
+    /// the anchor below spot. This only defers: the anchor climbs one step per block that carries a
+    /// fee-bearing swap, conversion resumes, every fee is kept as claims meanwhile, and the griefer
+    /// pays two market swaps for nothing. The deferral count is asserted so a change in the ratchet
+    /// shows up here; the limit itself is reported, not blessed.
+    function test_dipHeldAcrossABlockDefersBoundedlyThenRecovers() public {
+        _trade(true, true, 100 ether);
+        assertEq(hook.anchorSqrtPriceX96(), Q96);
+        uint256 fwaBefore = pair.balanceOf(address(this));
+        uint256 ethBefore = address(this).balance;
+        router.swap{value: 100_000 ether}(
+            market, SwapParams(true, -100_000 ether, uint160(Q96 * 7 / 10)), 100_000 ether, 0
+        );
+        uint256 fwaGot = pair.balanceOf(address(this)) - fwaBefore;
+        uint160 dipped = _spot();
+        Outcome memory dust = _trade(true, true, 20);
+        assertEq(dust.fee, 1);
+        assertEq(hook.observedSqrtPriceX96(), dipped, "a 1 wei fee is enough to record the dip");
+        vm.roll(vm.getBlockNumber() + 1);
+        router.swap(market, SwapParams(false, -int256(fwaGot), TickMath.MAX_SQRT_PRICE - 1), fwaGot, 0);
+        uint160 restored = _spot();
+        assertGt(uint256(restored), uint256(Q96) * 99 / 100, "the market is back near where it was");
+        uint256 deferred;
+        uint256 claims = manager.balanceOf(address(hook), uint160(FWA));
+        Outcome memory o;
+        for (uint256 i; i < 12; ++i) {
+            uint256 anchorBefore = hook.anchorSqrtPriceX96();
+            o = _trade(true, true, 100 ether);
+            uint256 anchor = hook.anchorSqrtPriceX96();
+            if (i == 0) {
+                assertEq(anchor, dipped, "the held dip is adopted in full");
+            } else {
+                assertEq(
+                    anchor, Math.min(uint256(restored), FullMath.mulDiv(anchorBefore, _factor(1000), 1e9))
+                );
+            }
+            if (o.spent != 0) break;
+            ++deferred;
+            claims += o.fee;
+            assertEq(manager.balanceOf(address(hook), uint160(FWA)), claims, "deferred fees are kept");
+            vm.roll(vm.getBlockNumber() + 1);
+        }
+        assertEq(deferred, 7, "a 30% dip in sqrt price costs seven blocks of deferral at 1000 bps");
+        assertEq(o.spent, o.fee + Math.min(claims, 4 * o.fee), "conversion resumes at the capped pace");
+        assertLe(uint256(_spot()), FullMath.mulDiv(hook.anchorSqrtPriceX96(), _factor(1000), 1e9));
+        assertLt(pair.balanceOf(address(this)), fwaBefore, "the griefer lost FWA");
+        assertLt(address(this).balance, ethBefore, "the griefer lost ETH");
         _assertSettled();
     }
 
@@ -94,7 +163,8 @@ contract AnchorAndPairExitTest is HookFixture, IUnlockCallback {
     /// forge-config: default.fuzz.runs = 400
     /// @dev Whatever the owner's bound, a same-block move in either direction before or after a
     /// trade, and however many blocks pass, every sale ends at or below the bound from the anchor
-    /// the hook promoted in an earlier block and below the absolute ceiling.
+    /// the hook promoted in an earlier block and below the absolute ceiling, and the anchor itself
+    /// never rises by more than one bound step per promotion from the configured price.
     function testFuzz_saleNeverPassesTheBoundFromTheAnchor(
         uint16 rawBps,
         uint96 rawMove,
@@ -128,13 +198,21 @@ contract AnchorAndPairExitTest is HookFixture, IUnlockCallback {
         uint160 spotBefore = _spot();
         uint256 claimsBefore = manager.balanceOf(address(hook), uint160(FWA));
         uint256 ethBefore = CREATOR.balance + manager.balanceOf(address(hook), 0);
+        uint256 anchorBefore = hook.anchorSqrtPriceX96();
         Outcome memory o = _trade(true, true, 10_000 ether);
         _assertAccounting(o, claimsBefore, ethBefore);
+        uint256 anchor = hook.anchorSqrtPriceX96();
+        // The ratchet: the first anchor is the configured price (Q96 here, whatever the market did
+        // since), and a promotion never lifts it by more than one bound step.
+        if (anchorBefore == 0) {
+            assertEq(anchor, Q96, "the first anchor is the configured price");
+        } else {
+            assertLe(anchor, FullMath.mulDiv(anchorBefore, _factor(bps), 1e9), "anchor rose over one step");
+        }
         uint160 spotAfter = _spot();
         if (spotAfter == spotBefore && o.spent == 0) return;
         // The hook touched the market: only within the owner's bounds, measured from an anchor
         // promoted in an earlier block, and never from a spot already at the ceiling.
-        uint256 anchor = hook.anchorSqrtPriceX96();
         assertGt(anchor, 0, "the market moved without an earlier-block anchor");
         assertGe(spotAfter, spotBefore, "a sale only raises sqrt(FWA/ETH)");
         assertLe(uint256(spotAfter), FullMath.mulDiv(anchor, _factor(bps), 1e9), "past the relative bound");
